@@ -149,6 +149,15 @@ Reglas del cálculo:
 
 **Simplificación de deudas.** Algoritmo voraz: se empareja al mayor deudor con el mayor acreedor y se salda el menor de los dos montos, hasta dejar todo en cero. Termina en como máximo *n − 1* transferencias. Encontrar el mínimo absoluto es un problema NP-difícil y no se justifica para esta app.
 
+## Seguridad de las credenciales
+
+La app **no guarda ni hashea contraseñas por su cuenta**: delega todo en Appwrite Auth.
+
+- La contraseña viaja solo por HTTPS hacia Appwrite (`account.create` y `createEmailPasswordSession`).
+- Appwrite almacena únicamente su **hash con sal** (Argon2 por defecto). Nunca queda en texto plano ni en la base de datos de la app.
+- El cliente no hashea antes de enviar a propósito: el hash pasaría a ser la contraseña efectiva y se perdería la protección del hash con sal del servidor.
+- La sesión la maneja el SDK con una cookie de sesión; la app no guarda tokens ni contraseñas en el dispositivo.
+
 ## Modelo de datos (Appwrite)
 
 ```mermaid
@@ -246,15 +255,15 @@ flutter run
 ### Tests
 
 ```bash
-flutter test test/split_logic_test.dart
+flutter test
 ```
 
-Cubren que el reparto en partes iguales y por porcentajes siempre sume el monto exacto, y que la simplificación de deudas deje a todos en cero.
+La suite está organizada por capas bajo `test/` y usa `mocktail` para simular Appwrite sin red. Cubre la lógica de reparto y de deudas (siempre suma el monto exacto y deja a todos en cero), los repositorios (incluido retry y rollback), los controllers y las pantallas.
 
 ## Limitaciones conocidas
 
 - **La validación está en la app y no en el servidor.** Un cliente modificado podría escribir gastos cuyas partes no sumen el monto.
-- **Las escrituras no son atómicas.** Un gasto y sus partes se crean en llamadas separadas, y borrar un gasto también. Si se corta la conexión a la mitad, quedan datos a medias.
+- **Las escrituras no son atómicas.** Un gasto y sus partes se crean en llamadas separadas. Hay retry con backoff y rollback compensatorio en el cliente, pero si la app se cierra en pleno rollback pueden quedar datos a medias; solo una Function lo resuelve del todo.
 - Sin modo offline.
 - Sin paginación: se leen hasta 100 gastos por grupo.
 - Los miembros "sin cuenta" no pueden iniciar sesión, solo existen como nombre dentro del grupo.
