@@ -2,13 +2,55 @@ import 'package:appwrite/appwrite.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/appwrite/appwrite_constants.dart';
 import '../../../core/appwrite/appwrite_providers.dart';
+import '../../../core/utils/retry.dart';
 import '../../groups/domain/group.dart';
 import '../domain/expense.dart';
 import '../domain/settlement.dart';
 
 class ExpensesRepository {
-  ExpensesRepository(this._databases);
+  ExpensesRepository(
+    this._databases, {
+    this.retryDelay = const Duration(milliseconds: 300),
+  });
   final Databases _databases;
+
+  /// Espera base del backoff entre reintentos (se baja a cero en tests).
+  final Duration retryDelay;
+
+  /// Crea un documento con retry idempotente; ver [retryCreate].
+  Future<void> _create(
+    String collectionId,
+    String id,
+    Map<String, dynamic> data,
+    List<String> permissions,
+  ) {
+    return retryCreate<Object>(
+      baseDelay: retryDelay,
+      create: () => _databases.createDocument(
+        databaseId: AppwriteConstants.databaseId,
+        collectionId: collectionId,
+        documentId: id,
+        data: data,
+        permissions: permissions,
+      ),
+      fetch: () => _databases.getDocument(
+        databaseId: AppwriteConstants.databaseId,
+        collectionId: collectionId,
+        documentId: id,
+      ),
+    );
+  }
+
+  Future<void> _delete(String collectionId, String id) {
+    return retryDelete(
+      baseDelay: retryDelay,
+      () => _databases.deleteDocument(
+        databaseId: AppwriteConstants.databaseId,
+        collectionId: collectionId,
+        documentId: id,
+      ),
+    );
+  }
 
   // OJO: Appwrite devuelve 25 filas por defecto, por eso el limit explícito.
   // Cuando haya grupos con más de 100 gastos, habrá que paginar.
@@ -54,36 +96,52 @@ class ExpensesRepository {
       Permission.delete(Role.team(group.teamId, 'owner')),
     ];
 
-    final expense = await _databases.createDocument(
-      databaseId: AppwriteConstants.databaseId,
-      collectionId: AppwriteConstants.expensesCollection,
-      documentId: ID.unique(),
-      data: {
-        'groupId': group.id,
-        'description': description,
-        'amount': amount,
-        'paidBy': paidBy,
-        'splitType': splitType,
-        'createdBy': createdBy,
-      },
-      permissions: permissions,
-    );
+    // IDs generados antes de escribir: hacen seguros los reintentos y
+    // permiten deshacer lo creado si algo falla a medias.
+    final expenseId = ID.unique();
+    final splitIds = <String>[];
 
-    for (final entry in shares.entries) {
-      await _databases.createDocument(
-        databaseId: AppwriteConstants.databaseId,
-        collectionId: AppwriteConstants.splitsCollection,
-        documentId: ID.unique(),
-        data: {
-          'expenseId': expense.$id,
+    try {
+      await _create(
+        AppwriteConstants.expensesCollection,
+        expenseId,
+        {
           'groupId': group.id,
-          'memberId': entry.key,
-          'share': entry.value,
+          'description': description,
+          'amount': amount,
+          'paidBy': paidBy,
+          'splitType': splitType,
+          'createdBy': createdBy,
         },
-        permissions: permissions,
+        permissions,
       );
+
+      for (final entry in shares.entries) {
+        final splitId = ID.unique();
+        splitIds.add(splitId);
+        await _create(
+          AppwriteConstants.splitsCollection,
+          splitId,
+          {
+            'expenseId': expenseId,
+            'groupId': group.id,
+            'memberId': entry.key,
+            'share': entry.value,
+          },
+          permissions,
+        );
+      }
+    } catch (_) {
+      // Rollback: un gasto sin todas sus partes dejaría los saldos mal.
+      for (final id in splitIds.reversed) {
+        await bestEffort(() => _delete(AppwriteConstants.splitsCollection, id));
+      }
+      await bestEffort(
+          () => _delete(AppwriteConstants.expensesCollection, expenseId));
+      rethrow;
     }
   }
+
   Future<List<Settlement>> listSettlements(String groupId) async {
     final res = await _databases.listDocuments(
       databaseId: AppwriteConstants.databaseId,
@@ -104,18 +162,17 @@ class ExpensesRepository {
     required String toMember,
     required int amount,
   }) async {
-    await _databases.createDocument(
-      databaseId: AppwriteConstants.databaseId,
-      collectionId: AppwriteConstants.settlementsCollection,
-      documentId: ID.unique(),
-      data: {
+    await _create(
+      AppwriteConstants.settlementsCollection,
+      ID.unique(),
+      {
         'groupId': group.id,
         'fromMember': fromMember,
         'toMember': toMember,
         'amount': amount,
         'createdBy': createdBy,
       },
-      permissions: [
+      [
         Permission.read(Role.team(group.teamId)),
         Permission.update(Role.user(createdBy)),
         Permission.delete(Role.user(createdBy)),
@@ -125,23 +182,17 @@ class ExpensesRepository {
     );
   }
 
-  /// Borra primero las partes y al final el gasto.
+  /// Borra primero las partes y al final el gasto. Un borrado no se puede
+  /// deshacer, pero cada paso es idempotente (404 = ya borrado): si falla a
+  /// medias, repetir la llamada con los mismos IDs lo completa.
   Future<void> deleteExpense({
     required String expenseId,
     required List<String> splitIds,
   }) async {
     for (final id in splitIds) {
-      await _databases.deleteDocument(
-        databaseId: AppwriteConstants.databaseId,
-        collectionId: AppwriteConstants.splitsCollection,
-        documentId: id,
-      );
+      await _delete(AppwriteConstants.splitsCollection, id);
     }
-    await _databases.deleteDocument(
-      databaseId: AppwriteConstants.databaseId,
-      collectionId: AppwriteConstants.expensesCollection,
-      documentId: expenseId,
-    );
+    await _delete(AppwriteConstants.expensesCollection, expenseId);
   }
 }
 
